@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Tipos + build. Não precisa de banco: todas as páginas são dinâmicas,
+  #    então o build funciona antes de você configurar o Supabase.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Typecheck + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci --no-audit --no-fund
+
+      - name: Verificação de tipos
+        run: npm run typecheck
+
+      - name: Build de produção
+        run: npm run build
+        env:
+          NEXT_PUBLIC_SITE_URL: http://localhost:3000
+          AUTH_SECRET: ci-only-secret-not-used-in-production
+
+  # ---------------------------------------------------------------------------
+  # 2) Migração + smoke test com um Postgres real (mesmo engine do Supabase).
+  #    Garante que supabase/schema.sql aplica limpo e que o site responde.
+  # ---------------------------------------------------------------------------
+  database:
+    name: Migração + smoke (Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: venly
+          POSTGRES_PASSWORD: venly
+          POSTGRES_DB: venly
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://venly:venly@localhost:5432/venly
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+      AUTH_SECRET: ci-only-secret-not-used-in-production
+      ADMIN_EMAIL: admin@venly.local
+      ADMIN_PASSWORD: ci-password-123456
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci --no-audit --no-fund
+
+      - name: Aplicar o schema (supabase/schema.sql)
+        run: npm run db:migrate
+
+      - name: Build
+        run: npm run build
+
+      - name: Subir o site e validar /api/health
+        run: |
+          npm start &
+          for i in $(seq 1 40); do
+            if curl -sf http://localhost:3000/api/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"database":"ok"' /tmp/health.json
+          curl -sf -o /dev/null http://localhost:3000/
+          curl -sf -o /dev/null http://localhost:3000/creates
+          curl -sf -o /dev/null http://localhost:3000/loja
+          curl -sf -o /dev/null http://localhost:3000/admin
+          echo "Smoke test OK"
